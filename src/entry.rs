@@ -7,6 +7,7 @@ enum EntryState<V> {
     // The pointer can't be null, because
     // `SoftDelete` represent pointer null situation
     Present(AtomicPtr<V>, PhantomData<V>),
+
     SoftDelete,
 
     // Expunged

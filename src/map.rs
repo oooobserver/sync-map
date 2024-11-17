@@ -2,18 +2,16 @@ use std::{
     collections::HashMap,
     ptr,
     rc::Rc,
-    sync::{
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-        Mutex,
-    },
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
+
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::entry::Entry;
 
 // The actual inner map.
 type Map<K, V> = HashMap<K, Rc<Entry<V>>>;
 
-// ReadOnly means the read map.
 struct ReadOnly<K, V>
 where
     K: std::cmp::Eq + std::hash::Hash,
@@ -112,15 +110,16 @@ where
     // The whole serach logic is like this:
     // First check the key in the read map, this don't need the lock.
     // Then try to find it in the dirty map, note this need the lock
-    pub fn load(&self, key: &K) -> Option<&V> {
+    pub fn load<'a>(&'a self, key: &K) -> Option<&'a V> {
         let read_only = self.load_readonly();
 
         if let Some(read) = read_only {
             let present = read.m.contains_key(key);
-            // Maybe the KV is in the dirty map.
+            // Maybe the KV is in the dirty map, but need to check if the read map
+            // has any change.
             if !present && read.amended {
-                let _lock = self.mu.lock().unwrap();
-                return self.load_dirty_locked(key);
+                let guard = self.dirty.lock().as_ref().unwrap();
+                return self.load_dirty_locked(key, &guard);
             }
 
             // Never insert this key before.
@@ -136,33 +135,45 @@ where
     }
 
     #[inline(always)]
-    fn load_dirty_locked(&self, key: &K) -> Option<&V> {
+    fn load_dirty_locked<'a>(
+        &self,
+        key: &K,
+        guard: &'a MutexGuard<'a, Option<Map<K, V>>>,
+    ) -> Option<&'a V> {
         let read_only = self.load_readonly();
         if let Some(read) = read_only {
             let present = read.m.contains_key(key);
-            if !present && read.amended {}
+            // Check the dirty map.
+            if !present && read.amended {
+                let dirty_map = guard.as_ref().unwrap();
+                let entry = dirty_map.get(key);
+                let res = if let Some(e) = entry { e.load() } else { None };
+                // self.miss_locked(guard);
+                return res;
+            }
         }
 
         None
     }
 
     // If misses hit the threshold, flip
-    fn miss_locked(&self) {
+    fn miss_locked(&self, mut guard: MutexGuard<'_, Option<Map<K, V>>>) {
         let num = self.misses.fetch_add(1, Ordering::Release) as usize;
-        if num + 1 < self.dirty.as_ref().unwrap().len() {
+        if num + 1 < guard.as_ref().unwrap().len() {
             return;
         }
 
         let new = Box::into_raw(Box::new(ReadOnly {
             amended: false,
-            m: self.dirty.take().unwrap(),
+            m: guard.take().unwrap(),
         }));
         let old = self.read.swap(new, Ordering::Release);
 
-        // m.read.Store(&readOnly{m: m.dirty})
-        // m.dirty = nil
-        // m.misses = 0
-        self.dirty = None;
+        unsafe {
+            let _ = Box::from_raw(old);
+        }
+
+        *guard = None;
         self.misses.store(0, Ordering::Release);
     }
 }
@@ -190,10 +201,11 @@ mod tests {
 
     #[test]
     fn drop() {
+        let mut map = HashMap::new();
+
         let s = String::from("this will put on the heap");
         let e = super::Entry::new(s);
 
-        let mut map = HashMap::new();
         map.insert(1, Rc::new(e));
     }
 }
